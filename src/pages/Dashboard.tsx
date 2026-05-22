@@ -794,7 +794,6 @@ export default function PersonalDashboard() {
 
   // Revenue YTD and computed percent
   const [revenueYTD, setRevenueYTD] = useState(0);
-  const [laborYTDPercent, setLaborYTDPercent] = useState<number | null>(null);
 
   // Timeline / charts
   const [timelineData, setTimelineData] = useState<any[]>([]);
@@ -859,23 +858,45 @@ export default function PersonalDashboard() {
         n_years: yearsBack,
       });
 
-      if (aggErr) {
-        console.warn("RPC get_weekly_for_last_n_years error (will fallback):", aggErr);
-        toast.error("RPC недоступен — использую fallback для timeline");
-        // fallback handling is possible (not implemented here for timeline) — RPC is preferred.
+      let rowsArr: any[] = (aggRows || []) as any[];
+
+      // Fallback: query weekly_reports directly when RPC fails or returns nothing
+      if (aggErr || !rowsArr.length) {
+        if (aggErr) console.warn("RPC error, falling back to direct query:", aggErr);
+        const minYear = new Date().getFullYear() - (yearsBack - 1);
+        const { data: rawRows, error: rawErr } = await supabase
+          .from("weekly_reports")
+          .select("year, week_number, total_revenue, labor_costs")
+          .eq("number", partNum)
+          .gte("year", minYear)
+          .limit(100000);
+
+        if (rawErr) {
+          console.error("Fallback query failed:", rawErr);
+        } else {
+          // Group by (year, week_number); SUM revenue (varies per category),
+          // MAX labor_costs (company-level total repeated per category row)
+          const map = new Map<string, { year: number; week_number: number; total_revenue: number; labor_costs: number }>();
+          (rawRows || []).forEach((r: any) => {
+            const y = Number(r.year);
+            const w = Number(r.week_number);
+            const key = `${y}-${String(w).padStart(2, "0")}`;
+            const ex = map.get(key) || { year: y, week_number: w, total_revenue: 0, labor_costs: 0 };
+            ex.total_revenue += Number(r.total_revenue || 0);
+            ex.labor_costs = Math.max(ex.labor_costs, Number(r.labor_costs || 0));
+            map.set(key, ex);
+          });
+          rowsArr = Array.from(map.values());
+        }
       }
 
-      const rowsArr = (aggRows || []) as any[];
-
       if (!rowsArr.length) {
-        // nothing
         setTimelineData([]);
         setThisWeekSales(0);
         setLastWeekSales(0);
         setSameWeekLastYearSales(0);
         setRevenueYTD(0);
         setLaborYTD(0);
-        setLaborYTDPercent(null);
         setWeeklyLabor(0);
         setPreviousWeekLabor(0);
         setComparativePoints([]);
@@ -976,7 +997,6 @@ export default function PersonalDashboard() {
       });
       setRevenueYTD(accRevenueYTD);
       setLaborYTD(accLaborYTD);
-      setLaborYTDPercent(accRevenueYTD > 0 ? (accLaborYTD / accRevenueYTD) * 100 : null);
 
       // comparative points offsets -4..+4 relative latest
       const offsetStart = -4;
@@ -1106,7 +1126,7 @@ export default function PersonalDashboard() {
                 <div className="text-xs text-muted-foreground">Labor YTD · Actual</div>
 
                 <div className="text-3xl font-bold mt-2">
-                  {laborYTDPercent === null ? "—" : `${laborYTDPercent.toFixed(1)}%`}
+                  {laborYTD === 0 ? "—" : `$${laborYTD.toLocaleString()}`}
                 </div>
               </div>
 
