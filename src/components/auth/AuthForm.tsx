@@ -61,12 +61,12 @@ export function AuthForm() {
           const userId = result.data?.user?.id;
           // Если сервер вернул userId — создаём профиль сразу
           if (userId) {
-            const { error: profileError } = await supabase.from("profiles").insert({
+            const { error: profileError } = await supabase.from("profiles").upsert({
               id: userId,
-              participant_number: companyNumber || null,
+              participant_number: companyNumber.trim().toUpperCase() || null,
               status: "active",
-              created_at: new Date().toISOString(),
-            });
+              updated_at: new Date().toISOString(),
+            }, { onConflict: 'id' });
 
             if (profileError) {
               console.error("Profile insert error:", profileError);
