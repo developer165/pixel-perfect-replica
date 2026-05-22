@@ -184,6 +184,7 @@ export default function RegionalBenchmarking() {
         throw rpcErr;
       }
 
+      // Parse all rows returned by the RPC (covers the two most recent years)
       const allRows = (data || []).map((r: any) => ({
         year: Number(r.year),
         week_number: Number(r.week_number),
@@ -194,40 +195,35 @@ export default function RegionalBenchmarking() {
 
       allRows.sort((a: any, b: any) => a.year - b.year || a.week_number - b.week_number);
 
-      // Find the most recent year with data
-      const years = [...new Set(allRows.map((r: any) => r.year))].sort((a, b) => a - b);
-      const maxYear = years[years.length - 1] ?? new Date().getFullYear();
-      const prevYear = maxYear - 1;
-
-      // Build lookup for prev year so we can use actual prev-year revenue as LY
-      const prevYearByWeek = new Map<number, any>();
+      // Build lookup per year so we can use the previous year's actual revenue as LY.
+      // The raw rev_week_last_year column repeats a company-total value across every
+      // category row (~20x per company-week), making a direct SUM wildly inflated.
+      // Using the previous year's total_revenue (same week_number) gives the correct value.
+      const byYearWeek = new Map<string, any>();
       allRows.forEach((r: any) => {
-        if (r.year === prevYear) prevYearByWeek.set(r.week_number, r);
+        byYearWeek.set(`${r.year}-${r.week_number}`, r);
       });
 
-      // Current-year rows enriched with correct LY values from previous year
-      const currentRows = allRows
-        .filter((r: any) => r.year === maxYear)
-        .map((r: any) => {
-          const ly = prevYearByWeek.get(r.week_number);
-          return {
-            year: r.year,
-            week_number: r.week_number,
-            total_revenue: r.total_revenue,
-            rev_week_last_year: ly ? ly.total_revenue : null,
-            num_transactions: r.num_transactions,
-            trans_week_last_year: ly ? ly.num_transactions : null,
-            avg_sale: r.avg_sale,
-            avg_sale_last_year: ly ? ly.avg_sale : null,
-          } as RpcRow;
-        });
+      // Enrich every row with correct LY from the previous year
+      const enriched: RpcRow[] = allRows.map((r: any) => {
+        const ly = byYearWeek.get(`${r.year - 1}-${r.week_number}`);
+        return {
+          year: r.year,
+          week_number: r.week_number,
+          total_revenue: r.total_revenue,
+          // Use actual prev-year revenue as LY; null if that year's data isn't in the RPC
+          rev_week_last_year: ly ? ly.total_revenue : null,
+          num_transactions: r.num_transactions,
+          trans_week_last_year: ly ? ly.num_transactions : null,
+          avg_sale: r.avg_sale,
+          avg_sale_last_year: ly ? ly.avg_sale : null,
+        };
+      });
 
-      currentRows.sort((a, b) => a.year - b.year || a.week_number - b.week_number);
-
-      if (limitWeeks && currentRows.length > 52) {
-        setRows(currentRows.slice(-52));
+      if (limitWeeks && enriched.length > 52) {
+        setRows(enriched.slice(-52));
       } else {
-        setRows(currentRows);
+        setRows(enriched);
       }
     } catch (e: any) {
       console.error("rpc err", e);
