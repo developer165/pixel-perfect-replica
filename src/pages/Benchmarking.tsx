@@ -6,10 +6,10 @@ import { ResponsiveContainer, ComposedChart, Bar, Line, XAxis, YAxis, CartesianG
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 
-/* Helper to strip trailing " — ..." from name */
-function stripCompanyNumber(nameOrNull?: string | null) {
-  if (!nameOrNull) return "";
-  return nameOrNull.replace(/\s+—.*$/u, "").trim();
+/** Extract the company NUMBER from "Name — NUMBER" display string */
+function extractNumber(displayName: string): string {
+  const m = displayName.match(/—\s*(\S+)\s*$/u);
+  return m ? m[1] : displayName.trim();
 }
 
 type RpcRow = {
@@ -99,18 +99,10 @@ export default function RegionalBenchmarking() {
     (async () => {
       setLoadingMeta(true);
       try {
-        // Load distinct regions and companies from views (assumes views exist)
-        const { data: regionViewRows, error: regionViewErr } = await (supabase as any).from("distinct_regions").select("region");
-        if (regionViewErr) console.warn("distinct_regions view read error:", regionViewErr);
-
-        const { data: companyViewRows, error: companyViewErr } = await (supabase as any)
-          .from("distinct_companies")
-          .select("company");
-        if (companyViewErr) console.warn("distinct_companies view read error:", companyViewErr);
+        // Load distinct regions from view
+        const { data: regionViewRows } = await (supabase as any).from("distinct_regions").select("region");
 
         let uniqRegions: string[] = [];
-        let displayNames: string[] = [];
-
         if (regionViewRows && Array.isArray(regionViewRows) && regionViewRows.length > 0) {
           uniqRegions = Array.from(
             new Set((regionViewRows || []).map((r: any) => ((r.region ?? "") as string).toString().trim())),
@@ -118,22 +110,34 @@ export default function RegionalBenchmarking() {
           uniqRegions.sort((a, b) => a.localeCompare(b));
         }
 
-        if (companyViewRows && Array.isArray(companyViewRows) && companyViewRows.length > 0) {
-          displayNames = Array.from(
-            new Set((companyViewRows || []).map((r: any) => ((r.company ?? "") as string).toString().trim())),
-          ).filter(Boolean) as string[];
+        // Load distinct company numbers from weekly_reports (distinct_companies view reads
+        // from profiles which may be empty, so query the source table directly)
+        const { data: companyRows } = await (supabase as any)
+          .from("weekly_reports")
+          .select("number, name")
+          .not("number", "is", null)
+          .order("number")
+          .limit(1000);
+
+        let displayNames: string[] = [];
+        if (companyRows && Array.isArray(companyRows) && companyRows.length > 0) {
+          const seen = new Set<string>();
+          companyRows.forEach((r: any) => {
+            const num = (r.number ?? "").toString().trim();
+            if (num && !seen.has(num)) {
+              seen.add(num);
+              // store as "Name — NUMBER" so we can show the name but filter by number
+              const displayName = r.name ? `${r.name} — ${num}` : num;
+              displayNames.push(displayName);
+            }
+          });
           displayNames.sort((a, b) => a.localeCompare(b));
         }
 
-        // Fallbacks (if views not present) are omitted here for brevity — keep existing fallback logic if needed.
-
         setRegions(uniqRegions);
         setCompanies(displayNames);
-
-        // default: all selected
         setSelectedRegions(uniqRegions.slice());
         setSelectedCompanies(displayNames.slice());
-
         setError(null);
       } catch (e: any) {
         console.error("meta load err", e);
@@ -145,17 +149,19 @@ export default function RegionalBenchmarking() {
   }, []);
 
   const buildRpcParams = () => {
-    const cleanSelectedCompanies = selectedCompanies.map((c) => (c || "").toString().trim()).filter(Boolean);
+    // Companies are stored as "Name — NUMBER"; extract the NUMBER part for the RPC filter
+    const cleanSelectedNumbers = selectedCompanies
+      .map((c) => extractNumber((c || "").toString()))
+      .filter(Boolean);
     const cleanSelectedRegions = selectedRegions.map((r) => (r || "").toString().trim()).filter(Boolean);
 
     const allRegionsSelected = cleanSelectedRegions.length === 0 || cleanSelectedRegions.length === regions.length;
-    const allCompaniesSelected =
-      cleanSelectedCompanies.length === 0 || cleanSelectedCompanies.length === companies.length;
+    const allCompaniesSelected = cleanSelectedNumbers.length === 0 || cleanSelectedNumbers.length === companies.length;
 
-    const p_regions = allRegionsSelected ? null : cleanSelectedRegions;
-    const p_companies = allCompaniesSelected ? null : cleanSelectedCompanies;
-
-    return { p_regions, p_companies };
+    return {
+      p_regions: allRegionsSelected ? null : cleanSelectedRegions,
+      p_companies: allCompaniesSelected ? null : cleanSelectedNumbers,
+    };
   };
 
   const fetchData = async () => {
@@ -164,32 +170,64 @@ export default function RegionalBenchmarking() {
     try {
       const { p_regions, p_companies } = buildRpcParams();
 
-      const callArgs: any = { p_regions: p_regions, p_companies: p_companies };
-      const { data, error: rpcErr } = await supabase.rpc("get_benchmark_weekly_metrics_v2", callArgs);
+      // Use the v1 RPC which is fast and returns data for the two most recent years.
+      // The rev_week_last_year column in the raw table is a company-level total repeated
+      // across every category row, so summing it inflates LY ~20x. Instead we build the
+      // correct LY by matching same week_number from the previous year's total_revenue.
+      const { data, error: rpcErr } = await supabase.rpc("get_benchmark_weekly_metrics", {
+        p_regions,
+        p_companies,
+      } as any);
 
       if (rpcErr) {
         console.error("rpc error", rpcErr);
         throw rpcErr;
       }
 
-      const typed = (data || []).map((r: any) => ({
+      const allRows = (data || []).map((r: any) => ({
         year: Number(r.year),
         week_number: Number(r.week_number),
         total_revenue: r.total_revenue === null ? null : Number(r.total_revenue),
-        rev_week_last_year: r.rev_week_last_year === null ? null : Number(r.rev_week_last_year),
         num_transactions: r.num_transactions === null ? null : Number(r.num_transactions),
-        trans_week_last_year: r.trans_week_last_year === null ? null : Number(r.trans_week_last_year),
         avg_sale: r.avg_sale === null ? null : Number(r.avg_sale),
-        avg_sale_last_year: r.avg_sale_last_year === null ? null : Number(r.avg_sale_last_year),
-      })) as RpcRow[];
+      }));
 
-      // ensure chronological order before slicing
-      typed.sort((a, b) => a.year - b.year || a.week_number - b.week_number);
+      allRows.sort((a: any, b: any) => a.year - b.year || a.week_number - b.week_number);
 
-      if (limitWeeks && typed.length > 52) {
-        setRows(typed.slice(-52));
+      // Find the most recent year with data
+      const years = [...new Set(allRows.map((r: any) => r.year))].sort((a, b) => a - b);
+      const maxYear = years[years.length - 1] ?? new Date().getFullYear();
+      const prevYear = maxYear - 1;
+
+      // Build lookup for prev year so we can use actual prev-year revenue as LY
+      const prevYearByWeek = new Map<number, any>();
+      allRows.forEach((r: any) => {
+        if (r.year === prevYear) prevYearByWeek.set(r.week_number, r);
+      });
+
+      // Current-year rows enriched with correct LY values from previous year
+      const currentRows = allRows
+        .filter((r: any) => r.year === maxYear)
+        .map((r: any) => {
+          const ly = prevYearByWeek.get(r.week_number);
+          return {
+            year: r.year,
+            week_number: r.week_number,
+            total_revenue: r.total_revenue,
+            rev_week_last_year: ly ? ly.total_revenue : null,
+            num_transactions: r.num_transactions,
+            trans_week_last_year: ly ? ly.num_transactions : null,
+            avg_sale: r.avg_sale,
+            avg_sale_last_year: ly ? ly.avg_sale : null,
+          } as RpcRow;
+        });
+
+      currentRows.sort((a, b) => a.year - b.year || a.week_number - b.week_number);
+
+      if (limitWeeks && currentRows.length > 52) {
+        setRows(currentRows.slice(-52));
       } else {
-        setRows(typed);
+        setRows(currentRows);
       }
     } catch (e: any) {
       console.error("rpc err", e);
